@@ -13,13 +13,15 @@ A compact CNN that classifies the 43 sign types of the **German Traffic Sign Rec
 1. [Quick start](#1-quick-start)
 2. [Project layout](#2-project-layout)
 3. [The dataset](#3-the-dataset)
-4. [How the code works](#4-how-the-code-works)
-5. [Results](#5-results)
-6. [Saved model and how to load it](#6-saved-model-and-how-to-load-it)
-7. [Runtime](#7-runtime)
-8. [Design choices](#8-design-choices)
-9. [Configuration reference](#9-configuration-reference)
-10. [Troubleshooting](#10-troubleshooting)
+4. [Model architecture](#4-model-architecture)
+5. [How the code works](#5-how-the-code-works)
+6. [Results](#6-results)
+7. [Saved model and how to load it](#7-saved-model-and-how-to-load-it)
+8. [Runtime](#8-runtime)
+9. [Design choices](#9-design-choices)
+10. [Configuration reference](#10-configuration-reference)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Deploying to the Ultra96-V2 (FPGA)](#12-deploying-to-the-ultra96-v2-fpga)
 
 ---
 
@@ -68,6 +70,11 @@ Everything goes to `./outputs/` on your machine. The container runs as your user
 ├── train.py                # entry point 1: train and save the model
 ├── evaluate.py             # entry point 2: test-set metrics and plots
 ├── predict.py              # entry point 3: classify arbitrary image files
+├── deploy/                 # Ultra96-V2 FPGA deployment (see DEPLOY_ULTRA96.md)
+│   ├── export_weights.py   # trained weights -> plain NumPy archive
+│   ├── quantize.py         # Vitis AI INT8 quantization + xmodel export
+│   └── gtsrb_dpu.py        # on-board inference with VART
+├── DEPLOY_ULTRA96.md       # step-by-step FPGA deployment guide
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -98,23 +105,122 @@ Everything goes to `./outputs/` on your machine. The container runs as your user
 - **43 classes**, heavily imbalanced: from about 210 to 2,250 training images per class. See `outputs/class_distribution.png`.
 - Images are small and vary in size: roughly 25×25 up to about 250×250 px.
 - Each CSV row has the image size, a **region of interest (ROI)** bounding box around the sign, the `ClassId`, and the image path.
-- The training set is made of **tracks**. A track is about 30 consecutive frames of the same physical sign, filmed as a car approaches it. The filename `00020_00007_00015.png` means class 20, track 7, frame 15. The validation split relies on this (see §4.3).
+- The training set is made of **tracks**. A track is about 30 consecutive frames of the same physical sign, filmed as a car approaches it. The filename `00020_00007_00015.png` means class 20, track 7, frame 15. The validation split relies on this (see §5.3).
 
 ![Class distribution](outputs/class_distribution.png)
 
 ---
 
-## 4. How the code works
+## 4. Model architecture
 
-### 4.1 `src/config.py`: one source of truth
+`TrafficSignCNN` (`src/model.py`) is a small VGG-style CNN: three convolutional blocks that halve the resolution and double the channels, followed by a two-layer classifier.
+
+| | |
+|---|---|
+| Input | 3×48×48 RGB, ROI-cropped, normalised with the GTSRB mean/std |
+| Output | 43 logits (softmax applied outside the model) |
+| Parameters | **593,675** (2.3 MB in fp32, about 0.6 MB in INT8) |
+| Compute | **87.2 M multiply-accumulates per image** (about 0.17 GOP) |
+| Largest activation | 32×48×48 = 73,728 values (about 72 KB in INT8) |
+
+### 4.1 Overview
+
+```mermaid
+flowchart LR
+    IN["input<br/>3×48×48"] --> B1["block 1<br/>3→32<br/>32×24×24"]
+    B1 --> B2["block 2<br/>32→64<br/>64×12×12"]
+    B2 --> B3["block 3<br/>64→128<br/>128×6×6"]
+    B3 --> P["avg pool<br/>128×3×3"]
+    P --> F["flatten<br/>1152"]
+    F --> FC1["Linear 1152→256<br/>ReLU, Dropout 0.3"]
+    FC1 --> FC2["Linear 256→43"]
+    FC2 --> OUT["43 logits"]
+```
+
+Each block (`conv_block`) is the same pattern:
+
+```
+Conv3×3 (bias=False) → BatchNorm → ReLU → Conv3×3 (bias=False) → BatchNorm → ReLU → MaxPool 2×2 → Dropout2d(0.15)
+```
+
+### 4.2 Layer by layer
+
+Shapes are for one image (C×H×W). Measured with forward hooks on the trained model. BatchNorm parameters are the learnable scale and shift (the running mean/var are buffers and aren't counted).
+
+| Stage | Layer | Output | Params | MACs |
+|---|---|---|---:|---:|
+| input | | 3×48×48 | | |
+| block 1 | Conv 3×3, 3→32 + BN + ReLU | 32×48×48 | 864 + 64 | 1.99 M |
+| | Conv 3×3, 32→32 + BN + ReLU | 32×48×48 | 9,216 + 64 | 21.23 M |
+| | MaxPool 2×2, Dropout2d | 32×24×24 | | |
+| block 2 | Conv 3×3, 32→64 + BN + ReLU | 64×24×24 | 18,432 + 128 | 10.62 M |
+| | Conv 3×3, 64→64 + BN + ReLU | 64×24×24 | 36,864 + 128 | 21.23 M |
+| | MaxPool 2×2, Dropout2d | 64×12×12 | | |
+| block 3 | Conv 3×3, 64→128 + BN + ReLU | 128×12×12 | 73,728 + 256 | 10.62 M |
+| | Conv 3×3, 128→128 + BN + ReLU | 128×12×12 | 147,456 + 256 | 21.23 M |
+| | MaxPool 2×2, Dropout2d | 128×6×6 | | |
+| head | AdaptiveAvgPool2d(3×3) | 128×3×3 | | |
+| | Flatten | 1152 | | |
+| | Linear 1152→256 + ReLU, Dropout(0.3) | 256 | 295,168 | 0.29 M |
+| | Linear 256→43 | 43 | 11,051 | 0.01 M |
+| **total** | | | **593,675** | **87.23 M** |
+
+Where the parameters and the compute sit:
+
+| Stage | Params | Share | MACs | Share |
+|---|---:|---:|---:|---:|
+| block 1 | 10,208 | 1.7% | 23.22 M | 26.6% |
+| block 2 | 55,552 | 9.4% | 31.85 M | 36.5% |
+| block 3 | 221,696 | 37.3% | 31.85 M | 36.5% |
+| classifier | 306,219 | 51.6% | 0.31 M | 0.4% |
+
+The classifier holds half the weights but does less than 0.4% of the arithmetic. The convolutions are the opposite: blocks 2 and 3 cost the same compute, because each halves the spatial size (÷4 positions) while doubling channels in and out (×4 per position).
+
+### 4.3 Receptive field
+
+How much of the 48×48 input one activation can "see":
+
+| After | Receptive field | Stride (input px) |
+|---|---:|---:|
+| block 1 | 6×6 | 2 |
+| block 2 | 16×16 | 4 |
+| block 3 | 36×36 | 8 |
+| avg pool (each of the 3×3 cells) | 44×44 | 16 |
+
+So every cell going into the classifier sees almost the whole sign, while the 3×3 grid still keeps a rough top/middle/bottom and left/centre/right layout. That layout is what tells "Turn left" from "Turn right", or a "6" from an "8" inside a speed-limit ring.
+
+### 4.4 Why it's built this way
+
+- **Two 3×3 convolutions per block** cover a 5×5 area with 18·C² weights instead of 25·C², and add an extra ReLU between them.
+- **`bias=False` on the convolutions**, because the BatchNorm right after each one already learns a shift.
+- **BatchNorm before ReLU** keeps training stable at the high OneCycle learning rate (3e-3).
+- **`Dropout2d`** in the blocks drops whole feature maps, which regularises convolutions better than element-wise dropout. It uses half the classifier rate (0.15 vs 0.3).
+- **`AdaptiveAvgPool2d((3,3))`** makes the head independent of the input size, so `--img-size 64` needs no code changes. At 48×48 it receives a 6×6 map and behaves exactly like `AvgPool2d(2)`.
+- **Small on purpose.** GTSRB signs are simple, high-contrast shapes, so 0.6 M parameters reach 99.4%. A bigger network would mostly add cost, which matters for the FPGA target below.
+
+### 4.5 Training vs inference
+
+| | `model.train()` | `model.eval()` / deployed |
+|---|---|---|
+| Dropout, Dropout2d | active | identity (removed) |
+| BatchNorm | batch statistics | running statistics; can be **folded into the preceding convolution** |
+| Output | logits → `CrossEntropyLoss(label_smoothing=0.1)` | logits → softmax for probabilities |
+
+Once dropout is removed and BatchNorm is folded, the inference graph contains only **Conv 3×3 + ReLU, MaxPool 2×2, AvgPool 2×2 and two fully connected layers**. All of these map directly onto the Xilinx DPU, so the whole network runs on the FPGA fabric as a single DPU subgraph. The only change needed for deployment is swapping `AdaptiveAvgPool2d((3,3))` for the equivalent `AvgPool2d(2)`. This was verified: the outputs are identical (max difference 0.0), and test accuracy stays at 99.43%. See [§12](#12-deploying-to-the-ultra96-v2-fpga).
+
+---
+
+## 5. How the code works
+
+### 5.1 `src/config.py`: one source of truth
 
 A single `@dataclass Config` holds every path and hyperparameter. `parse_args()` builds an `argparse` parser **from the dataclass fields**, so a new field automatically becomes a CLI flag (`data_dir` becomes `--data-dir`), and the two can never drift apart. Booleans accept `true/false/1/0/yes`. `cfg.ckpt_path` is always `<output_dir>/best_model.pt`, and `cfg.to_dict()` makes the config JSON-serialisable so it can be saved in the checkpoint.
 
-### 4.2 `src/classes.py`
+### 5.2 `src/classes.py`
 
 A list of the 43 class names, indexed by `ClassId`, e.g. `CLASS_NAMES[14] == "Stop"`. Plots, reports and predictions use it.
 
-### 4.3 `src/data.py`: loading, augmentation, splitting
+### 5.3 `src/data.py`: loading, augmentation, splitting
 
 - **`GTSRBDataset`**: reads rows from a CSV, opens each PNG as RGB and crops it to the **ROI box** (`Roi.X2/Y2` are inclusive, hence the `+1` for PIL). It then applies the transform. It exposes `.targets` so the class-distribution plot doesn't have to load any images.
 - **`build_transforms(img_size)`**:
@@ -126,35 +232,23 @@ A list of the 43 class names, indexed by `ClassId`, e.g. `CLASS_NAMES[14] == "St
 - **`build_loaders(cfg)`**: returns `train`, `val` and `test` DataLoaders. The train loader shuffles and uses `drop_last`. Pinned memory is used when a GPU is present, and worker processes persist between epochs.
 - **`denormalize()`**: undoes the normalisation so images can be plotted.
 
-### 4.4 `src/model.py`: `TrafficSignCNN`
+### 5.4 `src/model.py`: `TrafficSignCNN`
 
-A small VGG-style network with **593,675 parameters**:
+Implements the network described in [§4](#4-model-architecture):
 
-```
-input 3×48×48
- ├─ conv_block(3→32)    → 32×24×24
- ├─ conv_block(32→64)   → 64×12×12
- ├─ conv_block(64→128)  → 128×6×6
- ├─ AdaptiveAvgPool(3×3)→ 128×3×3
- └─ classifier: Flatten → Linear(1152→256) → ReLU → Dropout(0.3) → Linear(256→43)
+- **`conv_block(c_in, c_out, dropout)`**: returns one `nn.Sequential` feature block.
+- **`TrafficSignCNN(num_classes, dropout)`**: `features` (three blocks), then `pool`, then `classifier`. `forward()` returns raw logits; softmax is applied by the caller.
+- **`_init_weights()`**: Kaiming-normal init for the convolutions and Kaiming-uniform for the linear layers (both suit ReLU), with zero biases.
+- **`count_params()`**: the trainable parameter count printed by `train.py`.
 
-conv_block = [Conv3×3 → BatchNorm → ReLU] ×2 → MaxPool2 → Dropout2d(0.15)
-```
-
-- Two stacked 3×3 convolutions see a 5×5 area with fewer weights than one 5×5 convolution, and add an extra non-linearity.
-- `bias=False` on the convolutions, because the BatchNorm right after them already learns a shift.
-- `Dropout2d` drops whole feature maps, which regularises convolutional layers better than element-wise dropout.
-- Because of `AdaptiveAvgPool2d((3,3))`, the head works with any input size, so `--img-size 64` needs no code changes.
-- Weights start with Kaiming initialisation, which suits ReLU networks.
-
-### 4.5 `src/engine.py`: training and evaluation loops
+### 5.5 `src/engine.py`: training and evaluation loops
 
 - **`train_one_epoch()`**: for each batch: zero the gradients, run the forward pass under `torch.autocast` (mixed precision: fp16 on the GPU), compute the loss, back-propagate through `GradScaler` (which stops small fp16 gradients from rounding to zero), take an optimiser step, then a **scheduler step**, since OneCycle updates per batch. If `lr_log` is passed, it records the learning rate at each step for the LR plot. Returns the mean loss and accuracy.
 - **`evaluate()`**: runs under `@torch.no_grad()` in eval mode, so dropout is off and BatchNorm uses its running statistics. Returns the loss, accuracy, and the raw targets and softmax probabilities, which `evaluate.py` uses for every metric.
 
 There's no plotting or file I/O in here, so the loops stay simple to test and reuse.
 
-### 4.6 `src/utils.py`
+### 5.6 `src/utils.py`
 
 - `set_seed()`: seeds Python, NumPy and torch (CPU and CUDA) so runs are reproducible.
 - `get_device()`: picks CUDA if it's available and turns on `cudnn.benchmark`. The input size never changes, so cuDNN can benchmark once and use the fastest kernels.
@@ -162,7 +256,7 @@ There's no plotting or file I/O in here, so the loops stay simple to test and re
 - `load_model()`: rebuilds the model from the saved config, loads the weights with `weights_only=True` (safe loading, no arbitrary pickle) and switches to eval mode.
 - `EarlyStopping`: tracks the best validation accuracy and stops after `patience` epochs without improvement.
 
-### 4.7 `src/plots.py`
+### 5.7 `src/plots.py`
 
 Each function takes arrays and writes one PNG. It uses the headless `Agg` backend because Docker has no display.
 
@@ -176,7 +270,7 @@ Each function takes arrays and writes one PNG. It uses the headless `Agg` backen
 | `plot_confidence` | histogram of confidence for right vs wrong predictions, and a reliability diagram with ECE |
 | `plot_misclassified` | grid of the most confident mistakes |
 
-### 4.8 `train.py`
+### 5.8 `train.py`
 
 1. Parse the config, seed everything, pick the device. Mixed precision is used only on CUDA.
 2. Build the loaders, then save `config.json` and `class_distribution.png`.
@@ -188,11 +282,11 @@ Each function takes arrays and writes one PNG. It uses the headless `Agg` backen
 5. Save `history.json`, `training_curves.png` and `lr_schedule.png`.
 6. Reload the best checkpoint and export it with `torch.export` (batch size left dynamic) to `model_exported.pt2`.
 
-### 4.9 `evaluate.py`
+### 5.9 `evaluate.py`
 
 Loads `best_model.pt` and runs the whole test set. It computes accuracy, top-3 accuracy, macro and weighted F1, ECE and the error count, plus a per-class `classification_report`. It writes `test_metrics.json`, `classification_report.txt` and four plots. The misclassified grid is sorted by confidence, so the "confidently wrong" cases come first.
 
-### 4.10 `predict.py`
+### 5.10 `predict.py`
 
 Loads the checkpoint, applies the eval transform at the training image size, and prints the top-k classes with their probabilities for each image path. Paths are **inside the container**: dataset images are under `data/gtsrb/...`. For your own pictures, drop them into `outputs/` and pass `outputs/<file>`. A tightly cropped sign works best, because training used ROI crops.
 
@@ -212,11 +306,11 @@ data/gtsrb/Test/00001.png
 
 ---
 
-## 5. Results
+## 6. Results
 
 Default config, seed 42, RTX 4050 Laptop GPU.
 
-### 5.1 Headline test metrics (`outputs/test_metrics.json`)
+### 6.1 Headline test metrics (`outputs/test_metrics.json`)
 
 | Metric | Value |
 |---|---|
@@ -230,7 +324,7 @@ Default config, seed 42, RTX 4050 Laptop GPU.
 
 For context: the original GTSRB competition reported about 98.8% human accuracy, so this small model is in the same range.
 
-### 5.2 Training
+### 6.2 Training
 
 - Validation accuracy goes 34% → 76% → 95% → 98% over the first four epochs, then climbs slowly to a **best of 99.42% at epoch 21**, which is the saved checkpoint.
 - Training accuracy ends at 99.96%. The training loss stays at about 0.73 instead of approaching 0. That floor is expected with label smoothing, which never lets the target probability reach 1. It doesn't mean the model is underfitting.
@@ -239,7 +333,7 @@ For context: the original GTSRB competition reported about 98.8% human accuracy,
 
 ![Learning-rate schedule](outputs/lr_schedule.png)
 
-### 5.3 Where it fails
+### 6.3 Where it fails
 
 ![Per-class metrics](outputs/per_class_metrics.png)
 
@@ -271,7 +365,7 @@ Most common confusions:
 
 ![Confusion matrix](outputs/confusion_matrix.png)
 
-### 5.4 Calibration
+### 6.4 Calibration
 
 ![Confidence and reliability](outputs/confidence.png)
 
@@ -279,7 +373,7 @@ ECE is 0.095, and the reliability curve sits **above** the diagonal, so the mode
 
 ---
 
-## 6. Saved model and how to load it
+## 7. Saved model and how to load it
 
 | File | Size | What it is |
 |---|---|---|
@@ -303,7 +397,7 @@ logits = model(x)   # N×43
 
 ---
 
-## 7. Runtime
+## 8. Runtime
 
 Measured on an RTX 4050 Laptop GPU (6 GB) under WSL2, with 4 DataLoader workers:
 
@@ -318,9 +412,9 @@ On CPU only, expect training to be roughly 10–30× slower.
 
 ---
 
-## 8. Design choices
+## 9. Design choices
 
-- **Track-based validation split.** It keeps validation honest (§4.3). Here, validation and test differ by only 0.01 points.
+- **Track-based validation split.** It keeps validation honest (§5.3). Here, validation and test differ by only 0.01 points.
 - **ROI crop.** It removes the background before resizing, so more of the 48×48 pixels show the sign.
 - **No horizontal flips.** Flipped arrow signs are a different class.
 - **Macro F1 alongside accuracy.** With classes ranging from about 200 to 2,000+ images, a weak rare class could hide inside a high overall accuracy.
@@ -330,7 +424,7 @@ On CPU only, expect training to be roughly 10–30× slower.
 
 ---
 
-## 9. Configuration reference
+## 10. Configuration reference
 
 All fields live in `src/config.py` and can be overridden with `--flag-name value`.
 
@@ -354,7 +448,7 @@ All fields live in `src/config.py` and can be overridden with `--flag-name value
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -364,3 +458,17 @@ All fields live in `src/config.py` and can be overridden with `--flag-name value
 | Base image pull fails with `dial tcp [2600:...]: cannot assign requested address` | Docker is trying IPv6 without an IPv6 route. Prefer IPv4: `echo 'precedence ::ffff:0:0/96 100' \| sudo tee -a /etc/gai.conf && sudo systemctl restart docker`, then retry. Finished layers are kept. |
 | `error: externally-managed-environment` during build | Already handled by `PIP_BREAK_SYSTEM_PACKAGES=1` in the Dockerfile. |
 | Output files owned by root | Run with `UID=$(id -u) GID=$(id -g) docker compose run ...`. Compose defaults to 1000:1000. |
+
+---
+
+## 12. Deploying to the Ultra96-V2 (FPGA)
+
+The model is designed to run on the **Avnet Ultra96-V2** (Zynq UltraScale+ ZU3EG) using the Xilinx DPU and Vitis AI. **[DEPLOY_ULTRA96.md](DEPLOY_ULTRA96.md)** is the full step-by-step guide. In short:
+
+```
+best_model.pt ─export_weights.py─▶ gtsrb_float.npz ─quantize.py (Vitis AI)─▶ TrafficSignCNN_int.xmodel
+              ─vai_c_xir + arch.json─▶ gtsrb_cnn.xmodel ─scp─▶ Ultra96-V2 ─gtsrb_dpu.py (VART)─▶ predictions
+```
+
+Checked on the PC so far: the deploy version of the network (`AvgPool2d(2)` head, weights reloaded from the `.npz`) scores 99.43%, the same as the original. The board-side OpenCV preprocessing, with int8 input rounding, also scores 99.43% with the float model.
+
