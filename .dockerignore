@@ -1,0 +1,7 @@
+archive/
+data/
+outputs/
+**/__pycache__/
+**/*:Zone.Identifier
+.venv/
+.git/

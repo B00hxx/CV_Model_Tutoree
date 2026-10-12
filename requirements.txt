@@ -1,0 +1,6 @@
+# torch + torchvision come from the pytorch/pytorch base image (CUDA build).
+numpy
+pillow
+tqdm
+matplotlib
+scikit-learn

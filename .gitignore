@@ -1,0 +1,20 @@
+# Dataset (~600 MB): download from Kaggle into archive/, see README
+archive/
+data/
+
+# Windows download metadata (copied over from Windows into WSL)
+*:Zone.Identifier
+
+# Extra training runs (--output-dir outputs/<name>); the main run in outputs/ is kept
+outputs/*/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
